@@ -59,7 +59,7 @@ Adafruit_PN532 nfc(-1, -1);
 // For a http://www. url:
 //char * url = "cdn.discordapp.com/attachments/1495086319364476940/1495086385118314687/image-5.png?ex=69e4f733&is=69e3a5b3&hm=a9bb52adcc14cafca528b1c09f1e30ead6f7975fc3fdded0a27b254c3db0462c&";
 //uint8_t ndefprefix = NDEF_URIPREFIX_HTTPS;
-char * url = "apple.com";
+char * url = "github.com/Balabalu-VE/SCAM_Bot/blob/main/Jeff.png?raw=true";
 uint8_t ndefprefix = NDEF_URIPREFIX_HTTPS;
 //uint8_t ndefprefix = NDEF_URIPREFIX_HTTP_WWWDOT;
 
