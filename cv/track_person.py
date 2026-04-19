@@ -1,28 +1,29 @@
 from ultralytics import YOLO
 import cv2, time, imutils
 import mediapipe as mp
+import numpy as np
 from centroid_tracker import CentroidTracker
+MAX_LOST_FRAMES = 300
 
 def export_model_yolo():
     model = YOLO('yolov8n.pt')
-    model.export(format = 'ncnn', int8 = True)
+    model.export(format = 'ncnn', half = True)
 
 def camera_setup():
     print('starting camera setup')
     cam = cv2.VideoCapture(0)
     wait_time_for_camera = 90 # 90 sec
-    curr_wait = 0
+    curr_wait = time.time()
     while True:
         if not cam.isOpened():
-            if curr_wait > wait_time_for_camera:
+            if (time.time() - curr_wait) > wait_time_for_camera:
                 raise Exception('Camera took too long to init')
             time.sleep(5)
-            curr_wait += 5
         else:
             break
-    print(f'Camera inited in {curr_wait} seconds')
-    cam.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 320)
+    print(f'Camera inited in {(time.time() - curr_wait)} seconds')
+    cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 640)
     return cam
 def camera_click_pic(cam):
     res, frame = cam.read()
@@ -54,7 +55,7 @@ def basic_yolo_tracking_standalone(resave_model = False):
         results = model.track(
             source=frame, 
             persist=True, 
-            imgsz=320, 
+            imgsz=640, 
             tracker="yolo_tracker_custom.yaml", 
             classes=0, 
             stream=True
@@ -70,21 +71,69 @@ def basic_yolo_tracking_standalone(resave_model = False):
     cam.release()
     cv2.destroyAllWindows()
 
-def yolo_reid_rp(model, frame, locked_id = None):
+def yolo_reid_rp(model, frame_og, locked_id = None, lost_counter = 0, last_known_center = None):
+    frame = cv2.rotate(frame_og, cv2.ROTATE_90_COUNTERCLOCKWISE)
     results = model.track(
         source=frame, 
         persist=True, 
-        imgsz=320, 
+        imgsz=640, 
         tracker="yolo_tracker_custom.yaml", 
         classes=0, 
-        iou = 0.5,
-        conf = 0.3,
+        iou = 0.45,
+        device = 'cpu',
+        conf = 0.25,
         stream=True
     )
     target_found = False
     for r in results:
+        print('\t st iter -',  locked_id)
         # Use the built-in plotter to see the IDs on screen
         if True:
+            current_targets = {}
+            if r.boxes.id is not None:
+                # {id: [x1, y1, x2, y2, center_x, area]}
+                for box, track_id in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.id.cpu().numpy().astype(int)):
+                    cx = (box[0] + box[2]) / 2
+                    area = (box[2] - box[0]) * (box[3] - box[1])
+                    current_targets[track_id] = {'box': box, 'cx': cx, 'area': area}
+
+            # 1. INITIAL LOCK: Find biggest person
+            if locked_id is None and current_targets:
+                locked_id = max(current_targets, key=lambda k: current_targets[k]['area'])
+                lost_counter = 0
+                print(f"NEW LOCK: ID {locked_id}")
+
+            # 2. FOLLOW LOGIC
+            if locked_id in current_targets:
+                lost_counter = 0
+                last_known_center = current_targets[locked_id]['cx']
+                
+                # FIXED: Center is now 320 (640 / 2)
+                turn_error = last_known_center - 320 
+                
+                # UNCOMMENT to move:
+                # robot.move(turn_error) 
+                print(f"TRACKING ID {locked_id} | Error: {turn_error:.2f}")
+
+            # 3. RE-ID RECOVERY
+            elif locked_id is not None:
+                lost_counter += 1
+                
+                if last_known_center is not None:
+                    for tid, data in current_targets.items():
+                        # FIXED: Increased tolerance to 100px for 640px width
+                        if abs(data['cx'] - last_known_center) < 100: 
+                            print(f"RE-ID SUCCESS: Switching to ID {tid}")
+                            locked_id = tid
+                            lost_counter = 0
+                            break
+
+                if lost_counter > MAX_LOST_FRAMES:
+                    print("TARGET LOST")
+                    locked_id = None
+                    last_known_center = None
+
+        if False:
             current_targets = {}
             if r.boxes.id is not None:
                 # Map IDs to their box data
@@ -130,11 +179,12 @@ def yolo_reid_rp(model, frame, locked_id = None):
                 # 4. Calculate steering errors if a target exists
                 if target_info:
                     track_id, center_x, current_width = target_info
-                    turn_error = center_x - 160 # 160 is half of 320px
+                    turn_error = center_x - 320 # 160 is half of 320px
                     print(f"Tracking ID {track_id} | Turn: {turn_error:.2f} | Width: {current_width:.2f}")
                     # robot.drive(turn_error, current_width)
         annotated_frame = r.plot()
         cv2.imshow("NCNN Person Re-ID", annotated_frame)
+        print('\t end iter -',  locked_id)
     return locked_id
 
 def mediapipe_reid_rp(mp_drawing, detector, frame, ct_tracker = None):
@@ -226,6 +276,8 @@ def pi_optimized_tracking(tracking_type = 'yolo'):
     error_thres = 5
 
     locked_id = None
+    lost_counter = 0
+    last_known_center = None
 
     while True:
         frame = camera_click_pic(cam)
@@ -235,6 +287,8 @@ def pi_optimized_tracking(tracking_type = 'yolo'):
                 raise Exception('Pic click failed 5 times. killling')
             continue
         if tracking_type == 'yolo':
+            
+
             locked_id = yolo_reid_rp(model, frame, locked_id)
         elif tracking_type == 'mediapipe':
             with mp_object_detection.ObjectDetection(model_selection=0, min_detection_confidence=0.4) as detector:
