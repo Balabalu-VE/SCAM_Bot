@@ -1,9 +1,14 @@
 from ultralytics import YOLO
 import cv2, time, imutils
-import mediapipe as mp
+#import mediapipe as mp
 import numpy as np
 from centroid_tracker import CentroidTracker
+import serial
+
 MAX_LOST_FRAMES = 300
+FRAME_DIM_SIZE = 640
+FOCAL_LENGTH = 816     # Calibrated for Brio 105 @ 640x640
+REAL_WIDTH = 0.45      # Meters (average human shoulder width)
 
 def export_model_yolo():
     model = YOLO('yolov8n.pt')
@@ -21,10 +26,11 @@ def camera_setup():
             time.sleep(5)
         else:
             break
+    cam.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_DIM_SIZE)
+    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_DIM_SIZE)
     print(f'Camera inited in {(time.time() - curr_wait)} seconds')
-    cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 640)
     return cam
+
 def camera_click_pic(cam):
     res, frame = cam.read()
     if not res:
@@ -71,121 +77,83 @@ def basic_yolo_tracking_standalone(resave_model = False):
     cam.release()
     cv2.destroyAllWindows()
 
-def yolo_reid_rp(model, frame_og, locked_id = None, lost_counter = 0, last_known_center = None):
+def yolo_reid_rp(model, frame_og, ser, locked_id, lost_counter, last_known_center):
     frame = cv2.rotate(frame_og, cv2.ROTATE_90_COUNTERCLOCKWISE)
     results = model.track(
         source=frame, 
         persist=True, 
-        imgsz=640, 
+        imgsz=FRAME_DIM_SIZE, 
         tracker="yolo_tracker_custom.yaml", 
         classes=0, 
         iou = 0.45,
         device = 'cpu',
         conf = 0.25,
-        stream=True
+        stream=False
     )
-    target_found = False
+    current_targets = {}
     for r in results:
         print('\t st iter -',  locked_id)
         # Use the built-in plotter to see the IDs on screen
-        if True:
-            current_targets = {}
-            if r.boxes.id is not None:
-                # {id: [x1, y1, x2, y2, center_x, area]}
-                for box, track_id in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.id.cpu().numpy().astype(int)):
-                    cx = (box[0] + box[2]) / 2
-                    area = (box[2] - box[0]) * (box[3] - box[1])
-                    current_targets[track_id] = {'box': box, 'cx': cx, 'area': area}
+        if r.boxes.id is not None:
+            # {id: [x1, y1, x2, y2, center_x, area]}
+            for box, track_id in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.id.cpu().numpy().astype(int)):
+                cx = (box[0] + box[2]) / 2
+                area = (box[2] - box[0]) * (box[3] - box[1])
+                current_targets[track_id] = {'box': box, 'cx': cx, 'area': area}
 
-            # 1. INITIAL LOCK: Find biggest person
-            if locked_id is None and current_targets:
-                locked_id = max(current_targets, key=lambda k: current_targets[k]['area'])
-                lost_counter = 0
-                print(f"NEW LOCK: ID {locked_id}")
+        # 1. INITIAL LOCK: Find biggest person
+        if locked_id is None:
+            locked_id = max(current_targets, key=lambda k: current_targets[k]['area'])
+            lost_counter = 0
+            print(f"LOCKED: ID {locked_id}")
 
-            # 2. FOLLOW LOGIC
-            if locked_id in current_targets:
-                lost_counter = 0
-                last_known_center = current_targets[locked_id]['cx']
-                
-                # FIXED: Center is now 320 (640 / 2)
-                turn_error = last_known_center - 320 
-                
-                # UNCOMMENT to move:
-                # robot.move(turn_error) 
-                print(f"TRACKING ID {locked_id} | Error: {turn_error:.2f}")
+        # 2. FOLLOW LOGIC
+        if locked_id in current_targets:
+            lost_counter = 0
+            last_known_center = current_targets[locked_id]['cx']
+            
+            # FIXED: Center is now 320 (640 / 2)
+            turn_error = (FRAME_DIM_SIZE // 2) - last_known_center
+            # Distance (m) = (Real Width * Focal Length) / Pixel Width
+            distance = (REAL_WIDTH * FOCAL_LENGTH) / max(current_targets[locked_id]['width'], 1) 
+            
+            # UNCOMMENT to move:
+            print(f"TRACKING ID {locked_id} | Error: {turn_error:.2f} | Distance: {distance:.2f}")
+            if ser and ser.is_open():
+                message = f"{turn_error:.2f}, {distance:.2f}\n"
+                ser.write(message.encode('utf-8'))
 
-            # 3. RE-ID RECOVERY
-            elif locked_id is not None:
-                lost_counter += 1
-                
-                if last_known_center is not None:
-                    for tid, data in current_targets.items():
-                        # FIXED: Increased tolerance to 100px for 640px width
-                        if abs(data['cx'] - last_known_center) < 100: 
-                            print(f"RE-ID SUCCESS: Switching to ID {tid}")
-                            locked_id = tid
-                            lost_counter = 0
-                            break
+        # 3. RE-ID RECOVERY
+        elif locked_id is not None:
+            lost_counter += 1
 
-                if lost_counter > MAX_LOST_FRAMES:
-                    print("TARGET LOST")
-                    locked_id = None
-                    last_known_center = None
+            if last_known_center is not None:
+                best_new_id = None
+                min_dist = 100 # 100px search radius
+                for tid, data in current_targets.items():
+                    dist = abs(data['cx'] - last_known_center)
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_new_id = tid
 
-        if False:
-            current_targets = {}
-            if r.boxes.id is not None:
-                # Map IDs to their box data
-                for box, track_id in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.id.cpu().numpy().astype(int)):
-                    current_targets[track_id] = box
+                if best_new_id:
+                    print(f"RE-ID SUCCESS: {locked_id} -> {best_new_id}")
+                    locked_id = best_new_id
+                    lost_counter = 0
+                    break
 
-            # 1. INITIAL SELECTION: If we don't have a locked_id, find the biggest person
-            if locked_id is None and current_targets:
-                # Find ID with largest area
-                locked_id = max(current_targets, key=lambda k: (current_targets[k][2]-current_targets[k][0]) * (current_targets[k][3]-current_targets[k][1]))
-                print(f"LOCKED onto new target: ID {locked_id}")
+            if lost_counter > MAX_LOST_FRAMES:
+                print("10s TIMEOUT: Target lost.")
+                if ser and ser.is_open():
+                    message = "S\n" # to stop
+                    ser.write(message.encode('utf-8'))
+                locked_id = None
+                last_known_center = None
 
-            # 2. FOLLOW LOGIC: If our locked person is still in view, follow them
-            if locked_id in current_targets:
-                target_found = True
-                box = current_targets[locked_id]
-                turn_error = ((box[0] + box[2]) / 2) - 160
-                # robot.move(...)
-            else:
-                # 3. LOSS LOGIC: If they are gone, reset so we can find someone else
-                target_found = False
-                locked_id = None 
-        if False:
-            if r.boxes.id is not None:
-                # Extract boxes (x1, y1, x2, y2) and their assigned IDs
-                boxes = r.boxes.xyxy.cpu().numpy()
-                ids = r.boxes.id.cpu().numpy().astype(int)
-                
-                largest_area = 0
-                target_info = None
-
-                # 3. Find the largest box (The Closest Person)
-                for box, track_id in zip(boxes, ids):
-                    x1, y1, x2, y2 = box
-                    width = x2 - x1
-                    height = y2 - y1
-                    area = width * height
-                    
-                    if area > largest_area:
-                        largest_area = area
-                        target_info = (track_id, (x1 + x2) / 2, width)
-
-                # 4. Calculate steering errors if a target exists
-                if target_info:
-                    track_id, center_x, current_width = target_info
-                    turn_error = center_x - 320 # 160 is half of 320px
-                    print(f"Tracking ID {track_id} | Turn: {turn_error:.2f} | Width: {current_width:.2f}")
-                    # robot.drive(turn_error, current_width)
         annotated_frame = r.plot()
         cv2.imshow("NCNN Person Re-ID", annotated_frame)
         print('\t end iter -',  locked_id)
-    return locked_id
+    return locked_id, lost_counter, last_known_center
 
 def mediapipe_reid_rp(mp_drawing, detector, frame, ct_tracker = None):
     rects = []
@@ -255,10 +223,10 @@ def pi_optimized_tracking(tracking_type = 'yolo'):
         export_model_yolo()
         print('model saved')
         model = YOLO('yolov8n_ncnn_model', task='detect')
-    elif tracking_type == 'mediapipe':
-        mp_drawing = mp.solutions.drawing_utils
-        mp_object_detection = mp.solutions.object_detection
-        ct = CentroidTracker(max_disappeared=90)
+    # elif tracking_type == 'mediapipe':
+    #     mp_drawing = mp.solutions.drawing_utils
+    #     mp_object_detection = mp.solutions.object_detection
+    #     ct = CentroidTracker(max_disappeared=90)
     elif tracking_type == 'haar':
         full_cascade = cv2.CascadeClassifier('haarcascade_fullbody.xml')
         upper_cascade = cv2.CascadeClassifier('haarcascade_upperbody.xml')
@@ -272,8 +240,13 @@ def pi_optimized_tracking(tracking_type = 'yolo'):
     
     cam = camera_setup()
 
-    curr_error = 0
-    error_thres = 5
+    print('Starting serial comm setup')
+    ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
+    time.sleep(2)
+    print('Starting serial comm setup done')
+
+    cam_pic_click_error_count = 0
+    cam_pic_click_error_thresh = 5
 
     locked_id = None
     lost_counter = 0
@@ -282,17 +255,16 @@ def pi_optimized_tracking(tracking_type = 'yolo'):
     while True:
         frame = camera_click_pic(cam)
         if frame is None:
-            curr_error += 1
-            if curr_error > error_thres:
+            cam_pic_click_error_count += 1
+            if cam_pic_click_error_count > cam_pic_click_error_thresh:
                 raise Exception('Pic click failed 5 times. killling')
             continue
-        if tracking_type == 'yolo':
-            
 
-            locked_id = yolo_reid_rp(model, frame, locked_id)
-        elif tracking_type == 'mediapipe':
-            with mp_object_detection.ObjectDetection(model_selection=0, min_detection_confidence=0.4) as detector:
-                mediapipe_reid_rp(mp_drawing, detector, frame)
+        if tracking_type == 'yolo':
+            locked_id, lost_counter, last_known_center = yolo_reid_rp(model, frame, ser, locked_id, lost_counter, last_known_center)
+        # elif tracking_type == 'mediapipe':
+        #     with mp_object_detection.ObjectDetection(model_selection=0, min_detection_confidence=0.4) as detector:
+        #         mediapipe_reid_rp(mp_drawing, detector, frame)
         elif tracking_type == 'haar':
             haar_cascade_rp(full_cascade, upper_cascade, lower_cascade, frame)
         elif tracking_type == 'hog':
@@ -304,5 +276,6 @@ def pi_optimized_tracking(tracking_type = 'yolo'):
     cam.release()
     cv2.destroyAllWindows()
 
-pi_optimized_tracking(tracking_type='yolo')
+if __name__ == "__main__":
+    pi_optimized_tracking(tracking_type='yolo')
 
