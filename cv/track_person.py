@@ -1,14 +1,19 @@
 from ultralytics import YOLO
-import cv2, time, imutils
+import cv2, time, imutils, threading
 #import mediapipe as mp
 import numpy as np
 from centroid_tracker import CentroidTracker
 import serial
+from flask_stream_setup import streamer, run_server
 
 MAX_LOST_FRAMES = 300
 FRAME_DIM_SIZE = 640
 FOCAL_LENGTH = 816     # Calibrated for Brio 105 @ 640x640
 REAL_WIDTH = 0.45      # Meters (average human shoulder width)
+
+WEB_STREAM_ENABLED = True
+CV_SHOW_ENABLED = False
+SER_WRITE_ENABLED = True
 
 def export_model_yolo():
     model = YOLO('yolov8n.pt')
@@ -91,6 +96,8 @@ def yolo_reid_rp(model, frame_og, ser, locked_id, lost_counter, last_known_cente
         stream=False
     )
     current_targets = {}
+    distance = 2.0
+    turn_error = 0.0
     for r in results:
         print('\t st iter -',  locked_id)
         # Use the built-in plotter to see the IDs on screen
@@ -119,7 +126,7 @@ def yolo_reid_rp(model, frame_og, ser, locked_id, lost_counter, last_known_cente
             
             # UNCOMMENT to move:
             print(f"TRACKING ID {locked_id} | Error: {turn_error:.2f} | Distance: {distance:.2f}")
-            if ser and ser.is_open():
+            if SER_WRITE_ENABLED and ser and ser.is_open():
                 message = f"{turn_error:.2f}, {distance:.2f}\n"
                 ser.write(message.encode('utf-8'))
 
@@ -128,6 +135,16 @@ def yolo_reid_rp(model, frame_og, ser, locked_id, lost_counter, last_known_cente
             lost_counter += 1
 
             if last_known_center is not None:
+                if SER_WRITE_ENABLED and ser and ser.is_open():
+                    # Decay the error: Turn at 30% intensity of the last known position
+                    turn_error = (last_known_center - 320) * 0.3
+                    
+                    # Use the last distance calculation (we'll assume they are still there)
+                    # We'll use the 'distance' variable from the last successful frame
+                    # (Ensure 'distance' is initialized to a safe value like 2.0 at the top of your script)
+                    message = f"{turn_error:.2f}, {distance:.2f}\n"
+                    ser.write(message.encode('utf-8'))
+
                 best_new_id = None
                 min_dist = 100 # 100px search radius
                 for tid, data in current_targets.items():
@@ -144,14 +161,35 @@ def yolo_reid_rp(model, frame_og, ser, locked_id, lost_counter, last_known_cente
 
             if lost_counter > MAX_LOST_FRAMES:
                 print("10s TIMEOUT: Target lost.")
-                if ser and ser.is_open():
-                    message = "S\n" # to stop
-                    ser.write(message.encode('utf-8'))
+                # if SER_WRITE_ENABLED and ser and ser.is_open():
+                #     message = "S\n" # to stop
+                #     ser.write(message.encode('utf-8'))
                 locked_id = None
                 last_known_center = None
 
+
         annotated_frame = r.plot()
-        cv2.imshow("NCNN Person Re-ID", annotated_frame)
+        if locked_id in current_targets:
+            target = current_targets[locked_id]
+            box = target['box'].astype(int)
+            
+            # Draw a thicker GREEN border for the locked target
+            cv2.rectangle(annotated_frame, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 4)
+            
+            # Create the label string with distance
+            # distance is calculated in your follow logic
+            label = f"LOCKED ID:{locked_id} | {distance:.2f}m"
+            
+            # Draw a background label box for readability
+            (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(annotated_frame, (box[0], box[1] - 25), (box[0] + w, box[1]), (0, 255, 0), -1)
+            
+            # Write the text
+            cv2.putText(annotated_frame, label, (box[0], box[1] - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        if CV_SHOW_ENABLED:
+            cv2.imshow("NCNN Person Re-ID", annotated_frame)
+        if WEB_STREAM_ENABLED:
+            streamer.update_frame(annotated_frame)
         print('\t end iter -',  locked_id)
     return locked_id, lost_counter, last_known_center
 
@@ -218,7 +256,7 @@ def hog_rp(hog, frame):
     cv2.imshow("HOG Robot View", frame)
     return
 
-def pi_optimized_tracking(tracking_type = 'yolo'):
+def pi_optimized_tracking(tracking_type = 'yolo', test_mode = True):
     if tracking_type == 'yolo':
         export_model_yolo()
         print('model saved')
@@ -237,13 +275,14 @@ def pi_optimized_tracking(tracking_type = 'yolo'):
     else:
         print('bad type', tracking_type)
         return
-    
     cam = camera_setup()
 
-    print('Starting serial comm setup')
-    ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
-    time.sleep(2)
-    print('Starting serial comm setup done')
+    ser = None
+    if SER_WRITE_ENABLED:
+        print('Starting serial comm setup')
+        ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
+        time.sleep(2)
+        print('Starting serial comm setup done')
 
     cam_pic_click_error_count = 0
     cam_pic_click_error_thresh = 5
@@ -251,7 +290,8 @@ def pi_optimized_tracking(tracking_type = 'yolo'):
     locked_id = None
     lost_counter = 0
     last_known_center = None
-
+    if WEB_STREAM_ENABLED:
+        threading.Thread(target=run_server, daemon=True).start()
     while True:
         frame = camera_click_pic(cam)
         if frame is None:
@@ -270,8 +310,9 @@ def pi_optimized_tracking(tracking_type = 'yolo'):
         elif tracking_type == 'hog':
             frame = imutils.resize(frame, width=min(400, frame.shape[1]))
             hog_rp(hog, frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+        if CV_SHOW_ENABLED:
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
     cam.release()
     cv2.destroyAllWindows()
