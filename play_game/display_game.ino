@@ -80,7 +80,7 @@ void setup_display() {
   //testanimate(logo_bmp, LOGO_WIDTH, LOGO_HEIGHT); // Animate bitmaps
 }
 void draw_startup() {
-  const char* message = "<<< TAP TO START >>>   ";
+  const char* message = "<<< HOLD BUTTON TO START >>>   ";
   int16_t x = SCREEN_WIDTH;
 
   while (digitalRead(touchPin) == LOW) {
@@ -247,7 +247,7 @@ void drawGameUI(int score, int pos, int direction, int pulseDelay) {
 }
 
 void draw_scam() {
-  const char* message = "Tap phone here for Special Prize!!!   ";
+  const char* message = "Tap phone on gift for Special Prize!!!   ";
   int16_t x = SCREEN_WIDTH;
 
   while (digitalRead(touchPin) == LOW) {

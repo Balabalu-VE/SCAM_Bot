@@ -1,4 +1,4 @@
-#include <Bluepad32.h>
+  #include <Bluepad32.h>
 #include <AccelStepper.h>
 
 // ---------------- PIN DEFINITIONS ----------------
@@ -66,6 +66,19 @@ void setup_stepper() {
   Serial.println("Motors setup complete");
 }
 
+//Setup for reading input
+const int BUFFER_SIZE = 50;
+char buffer[BUFFER_SIZE];
+int bufferIndex = 0;
+
+bool messageReady = false;
+
+float distance = 0;
+float x_coordinate = 0;
+float kp_x = 2;
+float kp_distance = .5;
+//------------------------------
+
 // ---------------- GAMEPAD CALLBACKS ----------------
 void onConnectedGamepad(GamepadPtr gp) {
   for (int i = 0; i < maxGamepads; i++) {
@@ -98,14 +111,24 @@ void set_speeds() {
     if (abs(axisY) > 60) {
       stepper1.setSpeed((-axisY / 511.0) * MaxSpeed);
     } else {
-      stepper1.setSpeed(0);
+      //stepper1.setSpeed(0);
+      //Do autonomous code instead
+      stepper1.setSpeed(max(distance*kp_distance - x_coordinate*kp_x, MaxSpeed));
+      if(distance < 50){
+        stepper1.setSpeed(0.0);
+      }
     }
 
     // Right motor
     if (abs(axisRY) > 60) {
       stepper2.setSpeed((axisRY / 511.0) * MaxSpeed);
     } else {
-      stepper2.setSpeed(0);
+      //stepper2.setSpeed(0);
+      //Do autonomous code instead
+      stepper2.setSpeed(-max(distance*kp_distance + x_coordinate*kp_x, MaxSpeed));
+      if(distance < 50){
+        stepper2.setSpeed(0.0);
+      }
     }
 
   } else {
@@ -113,6 +136,58 @@ void set_speeds() {
     stepper2.setSpeed(0);
   }
 }
+//-------------Code for reading input ---------------------------
+void readSerialNonBlocking() {
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == '\n') {  // End of message
+      buffer[bufferIndex] = '\0';  // Null terminate
+      bufferIndex = 0;
+      messageReady = true;
+    }
+    else {
+      if (bufferIndex < BUFFER_SIZE - 1) {
+        buffer[bufferIndex++] = c;
+      }
+    }
+  }
+}
+
+void parseMessage() {
+  // Example: [123.4],[56.7]
+
+  char *token1 = strtok(buffer, ",");
+  char *token2 = strtok(NULL, ",");
+
+  if (token1 && token2) {
+    distance = atof(removeBrackets(token1));
+    x_coordinate = atof(removeBrackets(token2));
+
+    // Debug
+    Serial.print("Distance: ");
+    Serial.println(distance);
+    Serial.print("X: ");
+    Serial.println(x_coordinate);
+  } else {
+    Serial.println("Parse error");
+  }
+}
+
+char* removeBrackets(char* str) {
+  while (*str == '[') str++;  // skip leading [
+
+  char* end = str + strlen(str) - 1;
+  while (end > str && *end == ']') {
+    *end = '\0';
+    end--;
+  }
+
+  return str;
+}
+//-------------------------------
+
+
 
 // ---------------- SETUP ----------------
 void setup() {
@@ -131,6 +206,15 @@ void setup() {
 unsigned long lastControl = 0;
 const int controlHz = 200; // 200 Hz control loop
 void loop() {
+  //Reading serial
+  readSerialNonBlocking();
+
+  if (messageReady) {
+    parseMessage();
+    messageReady = false;
+  }
+  //------------------
+
   BP32.update();
 
   if (millis() - lastControl >= 5) { // 200 Hz

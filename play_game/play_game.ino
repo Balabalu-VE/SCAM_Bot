@@ -75,7 +75,7 @@ void handleTap() {
     direction *= -1;
 
     // Speed up
-    pulseDelay = max(minDelay, pulseDelay - 2);
+    pulseDelay = max(minDelay, pulseDelay - 3);
 
     flashColor(CRGB::Green);
   } else {
